@@ -3191,12 +3191,9 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
   __global__ void __launch_bounds__(BLOCKSIZE)
     GpuReduceKernel(SubExecParam* params, int waveOrder, int numSubIterations)
   {
-    // Read numSrcs and numDsts from first subexec param (consistent across all subexecs in this kernel)
+    // Read numSrcs and numDsts from first subexec param
     int const numSrcs = params[blockIdx.y].numSrcs;
     int const numDsts = params[blockIdx.y].numDsts;
-    
-    // Dispatch to specialized implementation for common cases
-    // These cover >95% of real-world usage patterns
     
     // Most common case: 1 src -> 1 dst (standard copy)
     if (numSrcs == 1 && numDsts == 1) {
