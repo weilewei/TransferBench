@@ -95,6 +95,7 @@ public:
   int useHipEvents;                  // Use HIP events for timing GFX/DMA Executor
   int useSingleStream;               // Use a single stream per GPU GFX executor instead of stream per Transfer
   int gfxSingleTeam;                 // Team all subExecutors across the data array
+  int gfxUseSpecialized;             // Use specialized kernels for (1,1), (0,1), (1,0) numSrcs/numDsts
   int gfxWaveOrder;                  // GFX-kernel wavefront ordering
   int gfxWordSize;                   // GFX-kernel packed data size (4=DWORDx4, 2=DWORDx2, 1=DWORDx1)
 
@@ -146,6 +147,7 @@ public:
     gfxSingleTeam     = GetEnvVar("GFX_SINGLE_TEAM"     , 1);
     gfxTemporal       = GetEnvVar("GFX_TEMPORAL"        , 0);
     gfxUnroll         = GetEnvVar("GFX_UNROLL"          , defaultGfxUnroll);
+    gfxUseSpecialized = GetEnvVar("GFX_USE_SPECIALIZED" , 0);
     gfxWaveOrder      = GetEnvVar("GFX_WAVE_ORDER"      , 0);
     gfxWordSize       = GetEnvVar("GFX_WORD_SIZE"       , 4);
     hideEnv           = GetEnvVar("HIDE_ENV"            , 0);
@@ -630,6 +632,7 @@ public:
     cfg.gfx.useHipEvents           = useHipEvents;
     cfg.gfx.useMultiStream         = !useSingleStream;
     cfg.gfx.useSingleTeam          = gfxSingleTeam;
+    cfg.gfx.useSpecialized         = gfxUseSpecialized;
     cfg.gfx.waveOrder              = gfxWaveOrder;
     cfg.gfx.wordSize               = gfxWordSize;
 

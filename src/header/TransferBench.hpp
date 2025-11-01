@@ -176,18 +176,19 @@ namespace TransferBench
    */
   struct GfxOptions
   {
-    int                 blockOrder     = 0;     ///< Determines how threadblocks are ordered (0=sequential, 1=interleaved, 2=random)
-    int                 blockSize      = 256;   ///< Size of each threadblock (must be multiple of 64)
-    vector<uint32_t>    cuMask         = {};    ///< Bit-vector representing the CU mask
-    vector<vector<int>> prefXccTable   = {};    ///< 2D table with preferred XCD to use for a specific [src][dst] GPU device
-    int                 seType         = 0;     ///< SubExecutor granularity type (0=threadblock, 1=warp)
-    int                 temporalMode   = 0;     ///< Non-temporal load/store mode 0=none, 1=load, 2=store, 3=both
-    int                 unrollFactor   = 4;     ///< GFX-kernel unroll factor
-    int                 useHipEvents   = 1;     ///< Use HIP events for timing GFX Executor
-    int                 useMultiStream = 0;     ///< Use multiple streams for GFX
-    int                 useSingleTeam  = 0;     ///< Team all subExecutors across the data array
-    int                 waveOrder      = 0;     ///< GFX-kernel wavefront ordering
-    int                 wordSize       = 4;     ///< GFX-kernel packed data size (4=dwordx4, 2=dwordx2, 1=dwordx1)
+    int                 blockOrder      = 0;     ///< Determines how threadblocks are ordered (0=sequential, 1=interleaved, 2=random)
+    int                 blockSize       = 256;   ///< Size of each threadblock (must be multiple of 64)
+    vector<uint32_t>    cuMask          = {};    ///< Bit-vector representing the CU mask
+    vector<vector<int>> prefXccTable    = {};    ///< 2D table with preferred XCD to use for a specific [src][dst] GPU device
+    int                 seType          = 0;     ///< SubExecutor granularity type (0=threadblock, 1=warp)
+    int                 temporalMode    = 0;     ///< Non-temporal load/store mode 0=none, 1=load, 2=store, 3=both
+    int                 unrollFactor    = 4;     ///< GFX-kernel unroll factor
+    int                 useHipEvents    = 1;     ///< Use HIP events for timing GFX Executor
+    int                 useMultiStream  = 0;     ///< Use multiple streams for GFX
+    int                 useSingleTeam   = 0;     ///< Team all subExecutors across the data array
+    int                 useSpecialized  = 0;     ///< Use specialized kernels for (1,1), (0,1), (1,0) numSrcs/numDsts
+    int                 waveOrder       = 0;     ///< GFX-kernel wavefront ordering
+    int                 wordSize        = 4;     ///< GFX-kernel packed data size (4=dwordx4, 2=dwordx2, 1=dwordx1)
   };
 
   /**
@@ -3189,30 +3190,36 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     }
   }
 
-  // Dispatch wrapper: Selects specialized kernel based on runtime numSrcs/numDsts
+  // Dispatch wrapper: Selects specialized kernel based on useSpecialized flag and runtime numSrcs/numDsts
   template <typename PACKED_FLOAT, int BLOCKSIZE, int UNROLL, int TEMPORAL_MODE>
   __global__ void __launch_bounds__(BLOCKSIZE)
-    GpuReduceKernel(SubExecParam* params, int seType, int warpSize, int waveOrder, int numSubIterations)
+    GpuReduceKernel(SubExecParam* params, int seType, int warpSize, int waveOrder, int numSubIterations, int useSpecialized)
   {
-    // Read numSrcs and numDsts from params
+    // Read numSrcs and numDsts from params (needed for both paths)
     int const numSrcs = params[blockIdx.y].numSrcs;
     int const numDsts = params[blockIdx.y].numDsts;
     
-    // Dispatch to specialized implementation for common cases
-    if (numSrcs == 1 && numDsts == 1) {
-      GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 1, 1>
-        (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
-    }
-    else if (numSrcs == 0 && numDsts == 1) {
-      GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 0, 1>
-        (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
-    }
-    else if (numSrcs == 1 && numDsts == 0) {
-      GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 1, 0>
-        (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
-    }
-    else {
-      // Fallback: Use (-1,-1) template which uses runtime arguments for any combination
+    if (useSpecialized) {
+      // Dispatch to specialized implementation for common cases
+      if (numSrcs == 1 && numDsts == 1) {
+        GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 1, 1>
+          (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
+      }
+      else if (numSrcs == 0 && numDsts == 1) {
+        GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 0, 1>
+          (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
+      }
+      else if (numSrcs == 1 && numDsts == 0) {
+        GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 1, 0>
+          (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
+      }
+      else {
+        // Fallback: Use (-1,-1) template which uses runtime arguments for any combination
+        GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, -1, -1>
+          (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
+      }
+    } else {
+      // Use generic kernel without specialization - pass runtime values
       GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, -1, -1>
         (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
     }
@@ -3240,7 +3247,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
    GPU_KERNEL_DWORD_DECL(BLOCKSIZE, 8)}
 
   // Table of all GPU Reduction kernel functions (templated blocksize / unroll / dword size / temporal)
-  typedef void (*GpuKernelFuncPtr)(SubExecParam*, int, int, int, int);
+  typedef void (*GpuKernelFuncPtr)(SubExecParam*, int, int, int, int, int);
   GpuKernelFuncPtr GpuKernelTable[MAX_WAVEGROUPS][MAX_UNROLL][3][4] =
   {
     GPU_KERNEL_UNROLL_DECL(64),
@@ -3290,12 +3297,12 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #if defined(__NVCC__)
     if (startEvent != NULL)
       ERR_CHECK(hipEventRecord(startEvent, stream));
-    gpuKernel<<<gridSize, blockSize, 0, stream>>>(rss.subExecParamGpuPtr, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations);
+    gpuKernel<<<gridSize, blockSize, 0, stream>>>(rss.subExecParamGpuPtr, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations, cfg.gfx.useSpecialized);
     if (stopEvent != NULL)
       ERR_CHECK(hipEventRecord(stopEvent, stream));
 #else
     hipExtLaunchKernelGGL(gpuKernel, gridSize, blockSize, 0, stream, startEvent, stopEvent,
-                          0, rss.subExecParamGpuPtr, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations);
+                          0, rss.subExecParamGpuPtr, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations, cfg.gfx.useSpecialized);
 #endif
 
     ERR_CHECK(hipStreamSynchronize(stream));
@@ -3368,14 +3375,14 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #if defined(__NVCC__)
       if (cfg.gfx.useHipEvents)
         ERR_CHECK(hipEventRecord(exeInfo.startEvents[0], stream));
-      gpuKernel<<<gridSize, blockSize, 0 , stream>>>(exeInfo.subExecParamGpu, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations);
+      gpuKernel<<<gridSize, blockSize, 0 , stream>>>(exeInfo.subExecParamGpu, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations, cfg.gfx.useSpecialized);
       if (cfg.gfx.useHipEvents)
         ERR_CHECK(hipEventRecord(exeInfo.stopEvents[0], stream));
 #else
       hipExtLaunchKernelGGL(gpuKernel, gridSize, blockSize, 0, stream,
                             cfg.gfx.useHipEvents ? exeInfo.startEvents[0] : NULL,
                             cfg.gfx.useHipEvents ? exeInfo.stopEvents[0] : NULL, 0,
-                            exeInfo.subExecParamGpu, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations);
+                            exeInfo.subExecParamGpu, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations, cfg.gfx.useSpecialized);
 #endif
       ERR_CHECK(hipStreamSynchronize(stream));
     }
