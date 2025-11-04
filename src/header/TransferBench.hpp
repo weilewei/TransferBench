@@ -3190,60 +3190,46 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     }
   }
 
-  // Host-side dispatch: Separate kernel entry points for each specialization
-  // This eliminates per-threadblock global loads and branches
-  
-  // Specialized kernel for (numSrcs=1, numDsts=1)
+  // Dispatch wrapper: Selects specialized kernel based on useSpecialized flag and runtime numSrcs/numDsts
   template <typename PACKED_FLOAT, int BLOCKSIZE, int UNROLL, int TEMPORAL_MODE>
   __global__ void __launch_bounds__(BLOCKSIZE)
-    GpuReduceKernel_1_1(SubExecParam* params, int seType, int warpSize, int waveOrder, int numSubIterations)
+    GpuReduceKernel(SubExecParam* params, int seType, int warpSize, int waveOrder, int numSubIterations, int useSpecialized)
   {
-    GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 1, 1>
-      (params, seType, warpSize, waveOrder, numSubIterations, 1, 1);
-  }
-
-  // Specialized kernel for (numSrcs=0, numDsts=1)
-  template <typename PACKED_FLOAT, int BLOCKSIZE, int UNROLL, int TEMPORAL_MODE>
-  __global__ void __launch_bounds__(BLOCKSIZE)
-    GpuReduceKernel_0_1(SubExecParam* params, int seType, int warpSize, int waveOrder, int numSubIterations)
-  {
-    GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 0, 1>
-      (params, seType, warpSize, waveOrder, numSubIterations, 0, 1);
-  }
-
-  // Specialized kernel for (numSrcs=1, numDsts=0)
-  template <typename PACKED_FLOAT, int BLOCKSIZE, int UNROLL, int TEMPORAL_MODE>
-  __global__ void __launch_bounds__(BLOCKSIZE)
-    GpuReduceKernel_1_0(SubExecParam* params, int seType, int warpSize, int waveOrder, int numSubIterations)
-  {
-    GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 1, 0>
-      (params, seType, warpSize, waveOrder, numSubIterations, 1, 0);
-  }
-
-  // Generic kernel for all other cases (or when useSpecialized=0)
-  template <typename PACKED_FLOAT, int BLOCKSIZE, int UNROLL, int TEMPORAL_MODE>
-  __global__ void __launch_bounds__(BLOCKSIZE)
-    GpuReduceKernel_generic(SubExecParam* params, int seType, int warpSize, int waveOrder, int numSubIterations)
-  {
-    // Generic path reads numSrcs/numDsts from params
+    // Read numSrcs and numDsts from params (needed for both paths)
     int const numSrcs = params[blockIdx.y].numSrcs;
     int const numDsts = params[blockIdx.y].numDsts;
-    GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, -1, -1>
-      (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
+    
+    if (useSpecialized) {
+      // Dispatch to specialized implementation for common cases
+      if (numSrcs == 1 && numDsts == 1) {
+        GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 1, 1>
+          (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
+      }
+      else if (numSrcs == 0 && numDsts == 1) {
+        GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 0, 1>
+          (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
+      }
+      else if (numSrcs == 1 && numDsts == 0) {
+        GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, 1, 0>
+          (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
+      }
+      else {
+        // Fallback: Use (-1,-1) template which uses runtime arguments for any combination
+        GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, -1, -1>
+          (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
+      }
+    } else {
+      // Use generic kernel without specialization - pass runtime values
+      GpuReduceKernelImpl<PACKED_FLOAT, BLOCKSIZE, UNROLL, TEMPORAL_MODE, -1, -1>
+        (params, seType, warpSize, waveOrder, numSubIterations, numSrcs, numDsts);
+    }
   }
 
-// Host-side dispatch: Kernel table with specialization dimension
-#define GPU_KERNEL_SPEC_DECL(BLOCKSIZE, UNROLL, DWORD, TEMPORAL)      \
-  {GpuReduceKernel_1_1<DWORD, BLOCKSIZE, UNROLL, TEMPORAL>,           \
-   GpuReduceKernel_0_1<DWORD, BLOCKSIZE, UNROLL, TEMPORAL>,           \
-   GpuReduceKernel_1_0<DWORD, BLOCKSIZE, UNROLL, TEMPORAL>,           \
-   GpuReduceKernel_generic<DWORD, BLOCKSIZE, UNROLL, TEMPORAL>}
-
-#define GPU_KERNEL_TEMPORAL_DECL(BLOCKSIZE, UNROLL, DWORD)            \
-  {GPU_KERNEL_SPEC_DECL(BLOCKSIZE, UNROLL, DWORD, TEMPORAL_NONE),     \
-   GPU_KERNEL_SPEC_DECL(BLOCKSIZE, UNROLL, DWORD, TEMPORAL_LOAD),     \
-   GPU_KERNEL_SPEC_DECL(BLOCKSIZE, UNROLL, DWORD, TEMPORAL_STORE),    \
-   GPU_KERNEL_SPEC_DECL(BLOCKSIZE, UNROLL, DWORD, TEMPORAL_BOTH)}
+#define GPU_KERNEL_TEMPORAL_DECL(BLOCKSIZE, UNROLL, DWORD)           \
+  {GpuReduceKernel<DWORD, BLOCKSIZE, UNROLL, TEMPORAL_NONE>,      \
+   GpuReduceKernel<DWORD, BLOCKSIZE, UNROLL, TEMPORAL_LOAD>,      \
+   GpuReduceKernel<DWORD, BLOCKSIZE, UNROLL, TEMPORAL_STORE>,     \
+   GpuReduceKernel<DWORD, BLOCKSIZE, UNROLL, TEMPORAL_BOTH>}
 
 #define GPU_KERNEL_DWORD_DECL(BLOCKSIZE, UNROLL)        \
   {GPU_KERNEL_TEMPORAL_DECL(BLOCKSIZE, UNROLL, float),  \
@@ -3260,11 +3246,9 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
    GPU_KERNEL_DWORD_DECL(BLOCKSIZE, 7),      \
    GPU_KERNEL_DWORD_DECL(BLOCKSIZE, 8)}
 
-  // Table of all GPU Reduction kernel functions
-  // Dimensions: [blocksize/64-1][unroll-1][wordSizeIdx][temporalMode][specType]
-  // specType: 0=(1,1), 1=(0,1), 2=(1,0), 3=generic
-  typedef void (*GpuKernelFuncPtr)(SubExecParam*, int, int, int, int);
-  GpuKernelFuncPtr GpuKernelTable[MAX_WAVEGROUPS][MAX_UNROLL][3][4][4] =
+  // Table of all GPU Reduction kernel functions (templated blocksize / unroll / dword size / temporal)
+  typedef void (*GpuKernelFuncPtr)(SubExecParam*, int, int, int, int, int);
+  GpuKernelFuncPtr GpuKernelTable[MAX_WAVEGROUPS][MAX_UNROLL][3][4] =
   {
     GPU_KERNEL_UNROLL_DECL(64),
     GPU_KERNEL_UNROLL_DECL(128),
@@ -3286,7 +3270,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
   #undef GPU_KERNEL_UNROLL_DECL
   #undef GPU_KERNEL_DWORD_DECL
   #undef GPU_KERNEL_TEMPORAL_DECL
-  #undef GPU_KERNEL_SPEC_DECL
+  #undef GPU_KERNEL_SE_TYPE_DECL
 
   // Execute a single GPU Transfer (when using 1 stream per Transfer)
   static ErrResult ExecuteGpuTransfer(int           const  iteration,
@@ -3307,33 +3291,18 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     int wordSizeIdx = cfg.gfx.wordSize == 1 ? 0 :
                       cfg.gfx.wordSize == 2 ? 1 :
                                               2;
-    
-    // Host-side dispatch: Select specialized kernel based on numSrcs/numDsts
-    int specType = 3;  // default: generic
-    if (cfg.gfx.useSpecialized && rss.subExecParamCpu.size() > 0) {
-      int const numSrcs = rss.subExecParamCpu[0].numSrcs;
-      int const numDsts = rss.subExecParamCpu[0].numDsts;
-      if (numSrcs == 1 && numDsts == 1) {
-        specType = 0;
-      } else if (numSrcs == 0 && numDsts == 1) {
-        specType = 1;
-      } else if (numSrcs == 1 && numDsts == 0) {
-        specType = 2;
-      }
-    }
-    
-    auto gpuKernel = GpuKernelTable[cfg.gfx.blockSize/64 - 1][cfg.gfx.unrollFactor - 1][wordSizeIdx][cfg.gfx.temporalMode][specType];
+    auto gpuKernel = GpuKernelTable[cfg.gfx.blockSize/64 - 1][cfg.gfx.unrollFactor - 1][wordSizeIdx][cfg.gfx.temporalMode];
     int warpSize = GetWarpSize();
 
 #if defined(__NVCC__)
     if (startEvent != NULL)
       ERR_CHECK(hipEventRecord(startEvent, stream));
-    gpuKernel<<<gridSize, blockSize, 0, stream>>>(rss.subExecParamGpuPtr, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations);
+    gpuKernel<<<gridSize, blockSize, 0, stream>>>(rss.subExecParamGpuPtr, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations, cfg.gfx.useSpecialized);
     if (stopEvent != NULL)
       ERR_CHECK(hipEventRecord(stopEvent, stream));
 #else
     hipExtLaunchKernelGGL(gpuKernel, gridSize, blockSize, 0, stream, startEvent, stopEvent,
-                          0, rss.subExecParamGpuPtr, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations);
+                          0, rss.subExecParamGpuPtr, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations, cfg.gfx.useSpecialized);
 #endif
 
     ERR_CHECK(hipStreamSynchronize(stream));
@@ -3400,45 +3369,20 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       int wordSizeIdx = cfg.gfx.wordSize == 1 ? 0 :
                         cfg.gfx.wordSize == 2 ? 1 :
                                                 2;
-      
-      // Host-side dispatch: Select specialized kernel based on numSrcs/numDsts
-      // Check if all transfers have same numSrcs/numDsts
-      int specType = 3;  // default: generic
-      if (cfg.gfx.useSpecialized && exeInfo.subExecParamCpu.size() > 0) {
-        int const numSrcs = exeInfo.subExecParamCpu[0].numSrcs;
-        int const numDsts = exeInfo.subExecParamCpu[0].numDsts;
-        bool allSame = true;
-        for (auto const& param : exeInfo.subExecParamCpu) {
-          if (param.numSrcs != numSrcs || param.numDsts != numDsts) {
-            allSame = false;
-            break;
-          }
-        }
-        if (allSame) {
-          if (numSrcs == 1 && numDsts == 1) {
-            specType = 0;
-          } else if (numSrcs == 0 && numDsts == 1) {
-            specType = 1;
-          } else if (numSrcs == 1 && numDsts == 0) {
-            specType = 2;
-          }
-        }
-      }
-      
-      auto gpuKernel = GpuKernelTable[cfg.gfx.blockSize/64 - 1][cfg.gfx.unrollFactor - 1][wordSizeIdx][cfg.gfx.temporalMode][specType];
+      auto gpuKernel = GpuKernelTable[cfg.gfx.blockSize/64 - 1][cfg.gfx.unrollFactor - 1][wordSizeIdx][cfg.gfx.temporalMode];
       int warpSize = GetWarpSize();
 
 #if defined(__NVCC__)
       if (cfg.gfx.useHipEvents)
         ERR_CHECK(hipEventRecord(exeInfo.startEvents[0], stream));
-      gpuKernel<<<gridSize, blockSize, 0 , stream>>>(exeInfo.subExecParamGpu, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations);
+      gpuKernel<<<gridSize, blockSize, 0 , stream>>>(exeInfo.subExecParamGpu, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations, cfg.gfx.useSpecialized);
       if (cfg.gfx.useHipEvents)
         ERR_CHECK(hipEventRecord(exeInfo.stopEvents[0], stream));
 #else
       hipExtLaunchKernelGGL(gpuKernel, gridSize, blockSize, 0, stream,
                             cfg.gfx.useHipEvents ? exeInfo.startEvents[0] : NULL,
                             cfg.gfx.useHipEvents ? exeInfo.stopEvents[0] : NULL, 0,
-                            exeInfo.subExecParamGpu, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations);
+                            exeInfo.subExecParamGpu, cfg.gfx.seType, warpSize, cfg.gfx.waveOrder, cfg.general.numSubIterations, cfg.gfx.useSpecialized);
 #endif
       ERR_CHECK(hipStreamSynchronize(stream));
     }
